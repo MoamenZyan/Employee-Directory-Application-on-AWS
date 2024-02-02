@@ -19,12 +19,20 @@ resource "aws_vpc" "main_vpc" {
 }
 
 # Creating Subnet
-resource "aws_subnet" "public_subnet" {
+resource "aws_subnet" "public_subnet1" {
   vpc_id                  = aws_vpc.main_vpc.id
   cidr_block              = "10.1.1.0/24"
   map_public_ip_on_launch = true
   availability_zone       = "eu-north-1a"
 }
+
+resource "aws_subnet" "public_subnet2" {
+  vpc_id                  = aws_vpc.main_vpc.id
+  cidr_block              = "10.1.2.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = "eu-north-1b"
+}
+
 # Creating IGW
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main_vpc.id
@@ -41,7 +49,7 @@ resource "aws_route_table" "rtb" {
 # Route Table Association
 
 resource "aws_route_table_association" "a" {
-  subnet_id      = aws_subnet.public_subnet.id
+  subnet_id      = aws_subnet.public_subnet1.id
   route_table_id = aws_route_table.rtb.id
 }
 
@@ -156,9 +164,9 @@ resource "aws_iam_role_policy_attachment" "db_role_policy_attachment" {
 
 # Creating DynamoDB Table
 resource "aws_dynamodb_table" "db_table" {
-  name     = "Employees"
-  hash_key = "id"
-  read_capacity = 1
+  name           = "Employees"
+  hash_key       = "id"
+  read_capacity  = 1
   write_capacity = 1
 
   attribute {
@@ -167,16 +175,87 @@ resource "aws_dynamodb_table" "db_table" {
   }
 }
 
+# Creating Load Balancer
+resource "aws_alb" "alb" {
+  name               = "app-lb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.main_sg.id]
+  subnets            = [aws_subnet.public_subnet1.id, aws_subnet.public_subnet2.id]
+}
+# Creating Target Group
+resource "aws_lb_target_group" "tg" {
+  name     = "app-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main_vpc.id
+}
 
-# Creating Instance
-resource "aws_instance" "vm" {
-  vpc_security_group_ids = [aws_security_group.main_sg.id]
-  subnet_id              = aws_subnet.public_subnet.id
-  ami                    = "ami-090793d48e56d862c"
-  instance_type          = "t3.micro"
-  key_name               = "laptop"
-  iam_instance_profile   = aws_iam_instance_profile.instance_profile.name
-  user_data              = <<-EOF
+# Creating Load Balancer Listener
+resource "aws_lb_listener" "lb" {
+  load_balancer_arn = aws_alb.alb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.tg.arn
+  }
+}
+
+# Creating Auto Scaling Group
+resource "aws_autoscaling_group" "asg" {
+  name                      = "app_asg"
+  max_size                  = 4
+  min_size                  = 2
+  desired_capacity          = 2
+  health_check_grace_period = 300
+  vpc_zone_identifier       = [aws_subnet.public_subnet1.id, aws_subnet.public_subnet2.id]
+  default_cooldown          = 300
+  launch_configuration      = aws_launch_configuration.launch_conf.id
+  target_group_arns         = [aws_lb_target_group.tg.arn]
+}
+
+# Attaching ASG To Load Balancer Target Group
+resource "aws_autoscaling_attachment" "asg_att" {
+  autoscaling_group_name = aws_autoscaling_group.asg.id
+  lb_target_group_arn    = aws_lb_target_group.tg.arn
+}
+
+# Creating ASG Policy
+resource "aws_autoscaling_policy" "asg_policy" {
+  name                   = "scale_up_policy"
+  autoscaling_group_name = aws_autoscaling_group.asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 300
+}
+
+# Creating Cloud Watch Alarm For ASG Scaling Policy
+resource "aws_cloudwatch_metric_alarm" "CPUAlarm" {
+  alarm_name          = "CPU-Alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  period              = 120
+  threshold           = 60
+  namespace           = "AWS/EC2"
+  statistic           = "Average"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.asg.name
+  }
+  alarm_actions = [aws_autoscaling_policy.asg_policy.arn]
+}
+
+# Creating Launch Configs
+resource "aws_launch_configuration" "launch_conf" {
+  name                 = "app_vm"
+  image_id             = "ami-090793d48e56d862c"
+  iam_instance_profile = aws_iam_instance_profile.instance_profile.name
+  instance_type        = "t3.micro"
+  security_groups      = [aws_security_group.main_sg.id]
+  key_name             = "laptop"
+  user_data            = <<-EOF
                 #!/bin/bash
                 cd /home/ec2-user
                 wget https://aws-tc-largeobjects.s3-us-west-2.amazonaws.com/DEV-AWS-MO-GCNv2/FlaskApp.zip
@@ -189,7 +268,7 @@ resource "aws_instance" "vm" {
                 export DYNAMO_MODE=on
                 FLASK_APP=application.py /usr/local/bin/flask run --host=0.0.0.0 --port=80 
   EOF
-  depends_on             = [aws_s3_bucket.bucket, aws_iam_role_policy_attachment.s3_role_policy_attachment]
+  depends_on           = [aws_s3_bucket.bucket, aws_iam_role_policy_attachment.s3_role_policy_attachment]
 }
 
 # Making Instance Profile
@@ -198,6 +277,7 @@ resource "aws_iam_instance_profile" "instance_profile" {
   role = aws_iam_role.EC2_role.name
 }
 
-output "instance-public-ip" {
-  value = aws_instance.vm.public_ip
+# Output Of LB DNS Name
+output "lb_public_ip" {
+  value = aws_alb.alb.dns_name
 }
